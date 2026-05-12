@@ -12,6 +12,8 @@
 
 ## Phase 1 Overview
 
+> **Prerequisite**: Day 0 (IAM Identity Center setup) must be complete before starting Day 1. Day 0 lives in its own doc and establishes the access foundation every command below depends on. See `docs/aws-access.md` for the access model.
+
 | Day | Topic | Deliverable |
 |-----|-------|-------------|
 | 1 | Repo scaffolding + Terraform state backend | `nainashee/sandcastle` repo + S3 state bucket + DynamoDB lock table |
@@ -27,7 +29,13 @@
 # Day 1 — Repo Scaffolding and Terraform State Backend
 
 **Time estimate**: 75 minutes
-**Prerequisites**: AWS CLI configured with the `launchpad` profile, Git installed, a GitHub account (`nainashee`)
+**Prerequisites**: Day 0 (IAM Identity Center setup) complete — `sandcastle` SSO profile working, MFA enforced, `docs/aws-access.md` written. Git installed, GitHub account (`nainashee`).
+
+> **SSO reminder**: All AWS commands in this plan use the `sandcastle` profile. If you get `ExpiredToken` or `Unable to locate credentials`, your SSO session has expired. Run:
+> ```bash
+> aws sso login --sso-session nainashee
+> ```
+> Sessions last ~8 hours. One login refreshes all four profiles (`sandcastle`, `cloudhunt`, `launchpad-sso`, `playhowzat`).
 
 ## Why we're doing this today
 
@@ -62,6 +70,13 @@ git remote add origin git@github.com:nainashee/sandcastle.git
 ```
 
 **Why public?** Portfolio projects need to be visible. Private repos are invisible to recruiters and interviewers. There's nothing sensitive in SandCastle — no real secrets, no proprietary code — so public is the right choice.
+
+> **Carry-over from Day 0**: You already wrote `docs/aws-access.md` during Day 0 Step 9 and saved it somewhere local. Copy it into the new repo's `docs/` folder now (you'll create the folder in Step 2):
+> ```bash
+> mkdir -p docs && cp /path/to/saved/aws-access.md docs/
+> ```
+>
+> **Legacy IAM user burn-in (FYI)**: Day 0 deactivated three IAM users (`launchpad-dev`, `cricket-zone-dev`, `hussain-admin`) with a delete date of **2026-06-09**. If any command in this plan still says `--profile launchpad` it's an oversight — flag it. The current correct profile names are `sandcastle`, `cloudhunt`, `launchpad-sso`, `playhowzat`. Any code on your laptop that still uses the old `launchpad` profile name will break on 2026-06-09 when the underlying IAM user is deleted — though since those keys are already `Inactive`, it's already broken; you just haven't run it yet.
 
 ## Step 2: Create the directory structure (5 min)
 
@@ -136,8 +151,17 @@ set -euo pipefail
 
 # ---- Configuration ----
 AWS_REGION="us-east-1"
-AWS_PROFILE="${AWS_PROFILE:-launchpad}"
 PROJECT_NAME="sandcastle"
+
+# Day 0 discipline: profile must be set explicitly. No defaults.
+if [ -z "${AWS_PROFILE:-}" ]; then
+  echo "ERROR: AWS_PROFILE must be set explicitly."
+  echo "Example: AWS_PROFILE=sandcastle ./bootstrap-state-backend.sh"
+  echo ""
+  echo "If you get a credential error after setting it, run:"
+  echo "  aws sso login --sso-session nainashee"
+  exit 1
+fi
 
 # Account ID is appended for global S3 bucket uniqueness
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --profile "$AWS_PROFILE")
@@ -297,43 +321,47 @@ Add to `LEARNINGS.md`:
 ## Multiple Choice Quiz
 
 **Q1.** Why does the Terraform state backend (S3 + DynamoDB) need to be created *outside* of Terraform?
-- A) Terraform doesn't support creating S3 buckets
-- B) It's a chicken-and-egg problem: the state backend must exist before Terraform can store state in it
-- C) AWS doesn't allow Terraform to create state buckets
-- D) It would be slower to create it in Terraform
+- A) AWS rate-limits backend resource creation when done via Terraform
+- B) The S3 bucket can technically be created by Terraform, but the DynamoDB lock table cannot
+- C) The state backend must exist before `terraform init` can use it; you can't store state in a bucket Terraform hasn't created yet
+- D) Terraform doesn't support S3 buckets in its AWS provider
 
-**Q2.** What is the purpose of the DynamoDB table in a Terraform S3 backend?
-- A) Storing the actual Terraform state
-- B) Caching plan output for faster applies
-- C) State locking — preventing concurrent applies from corrupting state
-- D) Storing AWS credentials
+**Q2.** Two engineers run `terraform apply` against the same state file at the same time, without a lock table configured. What's the most likely outcome?
+- A) State corruption: one apply overwrites the other's state, leaving Terraform's view out of sync with AWS reality
+- B) The second `apply` queues automatically and runs after the first finishes
+- C) Both applies succeed cleanly because S3 versioning resolves the conflict
+- D) AWS API rate limiting prevents one of them from completing
 
-**Q3.** Why is S3 versioning critical for a Terraform state bucket?
-- A) It's required by AWS
-- B) It allows rolling back if state is corrupted or accidentally overwritten
-- C) It encrypts the state
-- D) It improves performance
+**Q3.** You discover your `terraform.tfstate` file in S3 has been silently corrupted. Versioning is enabled. What's your fastest recovery path?
+- A) Run `terraform refresh` to rebuild state from current AWS resources
+- B) Delete the state and run `terraform import` for every resource
+- C) Use AWS Config to roll back the affected resources
+- D) Use S3 versioning to restore a known-good prior version of the state object
 
-**Q4.** Which S3 setting prevents a state file from being accidentally exposed to the internet?
-- A) Bucket encryption
-- B) Versioning
-- C) Block public access (all four sub-settings)
-- D) Tagging
+**Q4.** Of the four S3 Block Public Access settings (`BlockPublicAcls`, `IgnorePublicAcls`, `BlockPublicPolicy`, `RestrictPublicBuckets`), which is most directly defending against a future colleague accidentally attaching a permissive bucket policy?
+- A) `BlockPublicAcls`
+- B) `BlockPublicPolicy`
+- C) `IgnorePublicAcls`
+- D) `RestrictPublicBuckets`
 
-**Q5.** Why use `PAY_PER_REQUEST` billing mode for the lock table instead of provisioned capacity?
-- A) It's the only mode that supports locks
-- B) Lock operations are infrequent; provisioned capacity would be wasteful
-- C) Pay-per-request is always cheaper
-- D) It enables encryption
+**Q5.** You're choosing between `PAY_PER_REQUEST` and `PROVISIONED` (with 5 RCU/5 WCU) billing for the Terraform lock table. The lock table sees roughly 20 read/write operations per day. Why is `PAY_PER_REQUEST` the right call?
+- A) `PAY_PER_REQUEST` has no minimum monthly cost and scales to zero between applies; provisioned would bill 24/7 for capacity you barely use
+- B) Provisioned capacity has a 25 RCU/WCU minimum which would be wasteful for this workload
+- C) Lock operations require the higher consistency model only `PAY_PER_REQUEST` provides
+- D) `PROVISIONED` doesn't support the `LockID` partition key Terraform requires
 
 <details>
 <summary>Answers</summary>
 
-1. **B** — The state backend must exist before Terraform initializes against it. This is why a one-time bootstrap script is the standard pattern.
-2. **C** — DynamoDB stores a lock record while a `terraform apply` is in progress. Other applies see the lock and wait or error out.
-3. **B** — Versioning is your safety net. State corruption is real (it has happened in production at most companies that use Terraform). Versioning lets you restore yesterday's state in seconds.
-4. **C** — All four block public access settings working together is what prevents misconfiguration from leaking state. Encryption (A) protects content; public access blocking protects exposure.
-5. **B** — Lock table activity is sporadic — a few writes per `terraform apply`. Pay-per-request has no minimum cost and scales to zero. Provisioned capacity (10 RCU/WCU) would cost a few dollars/month for no benefit.
+1. **C** — The chicken-and-egg framing. Note A (rate limiting), B (DynamoDB-can't-be-Terraformed), and D (no S3 support) are all plausible-sounding wrong answers — Terraform can absolutely create both S3 buckets and DynamoDB tables, the issue is purely about ordering.
+
+2. **A** — State corruption is the real risk. Note B is wrong but tempting: Terraform doesn't queue applies, that's what the DynamoDB lock is supposed to do (and is absent in this scenario). C confuses object versioning with concurrency control.
+
+3. **D** — S3 versioning is exactly why we enabled it on Day 1. Note A (`terraform refresh`) sounds plausible but refresh updates state from reality — it can't undo a corruption that already wrote bad state. B works but is hours of work; D is seconds.
+
+4. **B** — `BlockPublicPolicy` specifically prevents new public bucket policies from being attached. `BlockPublicAcls` (A) deals with ACLs, not policies. `IgnorePublicAcls` (C) ignores existing public ACLs. `RestrictPublicBuckets` (D) prevents public access at the request level. All four together form defense-in-depth — the question asks which one targets the specific scenario.
+
+5. **A** — Cost behavior. Note B is wrong on the specifics (provisioned has no 25 RCU minimum — you can provision as low as 1). C and D invent technical requirements that don't exist. The real reason is purely economic: sporadic workloads + always-on provisioning = waste.
 
 </details>
 
@@ -439,9 +467,9 @@ variable "aws_region" {
 }
 
 variable "aws_profile" {
-  description = "AWS CLI profile to use"
+  description = "AWS CLI profile to use (Day 0 Identity Center SSO profile)"
   type        = string
-  default     = "launchpad"
+  default     = "sandcastle"
 }
 
 variable "vpc_cidr" {
@@ -683,44 +711,48 @@ Add to `LEARNINGS.md`:
 
 ## Multiple Choice Quiz
 
-**Q1.** Why does the `sandcastle-keep-sg` security group have zero inbound rules?
-- A) It's a Terraform default
-- B) Access is via SSM Session Manager, which uses outbound-initiated connections only
-- C) Inbound rules cost extra
-- D) AWS doesn't allow inbound rules in public subnets
+**Q1.** A colleague reviewing your Terraform asks why `sandcastle-keep-sg` has zero inbound rules but you can still get a shell on the instance. What's the technically correct explanation?
+- A) The keep is in a public subnet, and public-subnet instances accept SSM traffic regardless of security group
+- B) SSM Session Manager opens a port dynamically when a session starts
+- C) The SSM agent on the instance maintains an outbound HTTPS connection to the SSM regional endpoint; the AWS Console proxies your shell through that pre-existing connection
+- D) Security groups only filter inbound traffic from outside the VPC, and SSM traffic originates from within AWS
 
-**Q2.** What does `map_public_ip_on_launch = true` do on a subnet?
-- A) Forces all instances to use Elastic IPs
-- B) Automatically assigns a public IP to instances launched in this subnet
-- C) Maps the subnet to a public DNS name
-- D) Enables the internet gateway
+**Q2.** What does `map_public_ip_on_launch = true` on a subnet actually do?
+- A) It allocates an Elastic IP for the subnet itself
+- B) It maps the subnet's CIDR block to a public DNS zone
+- C) It enables internet routing for the subnet
+- D) It assigns a public IPv4 address to every instance launched in this subnet (without requiring an Elastic IP)
 
-**Q3.** Why does the route table need a `0.0.0.0/0` route to the internet gateway?
-- A) Without it, instances can't reach the internet for package installs, GitHub, etc.
-- B) It's required for the VPC to function
-- C) It's only needed for inbound traffic
-- D) It enables SSM
+**Q3.** Your VPC has a public subnet, an Internet Gateway, and `enable_dns_hostnames = true`. You launch an instance, but it can't reach `pypi.org` to install Python packages. The most likely missing piece is:
+- A) A NAT Gateway in the public subnet
+- B) A `0.0.0.0/0` route to the IGW in the subnet's route table
+- C) An outbound rule on the security group (egress is denied by default)
+- D) A DNS resolver attached to the VPC
 
-**Q4.** What is the purpose of `default_tags` in the AWS provider block?
-- A) It tags only the provider itself
-- B) Every resource managed by this provider gets these tags automatically, preventing missed tags
-- C) It sets default values for resource arguments
-- D) It applies tags only at first apply
+**Q4.** You add `default_tags { Project = "sandcastle" }` to the AWS provider, then run `terraform apply`. Which resources in your config receive the tag?
+- A) Every resource created or updated by this provider, automatically — including future resources you haven't written yet
+- B) Only resources explicitly listed in a `tags` argument
+- C) Only top-level resources, not those inside modules
+- D) Only resources created in the current `apply`; existing ones must be re-tagged manually
 
-**Q5.** Why is `enable_dns_hostnames = true` set on the VPC?
-- A) It's required by Terraform
-- B) It allows instances to resolve internal AWS service endpoints by hostname (e.g., SSM endpoints)
-- C) It enables Route 53
-- D) It allows external DNS resolution
+**Q5.** You set `enable_dns_hostnames = false` on the VPC. Which of these breaks?
+- A) Outbound internet access from instances
+- B) `terraform apply` will refuse to create the VPC
+- C) SSM agent registration, because the agent resolves the SSM endpoint by hostname inside the VPC
+- D) Security group rule evaluation for traffic identified by DNS name
 
 <details>
 <summary>Answers</summary>
 
-1. **B** — SSM uses an outbound HTTPS connection from the SSM agent on the instance to the SSM service. No inbound port is required. This is the whole point.
-2. **B** — Public subnets need this for instances to get a public IP. Without it, you'd have to allocate Elastic IPs manually.
-3. **A** — The route table tells the VPC how to route traffic. Without a default route, traffic destined outside the VPC has nowhere to go.
-4. **B** — Default tags are applied at the provider level. Every resource gets them. Critical for consistent tagging and cost allocation.
-5. **B** — DNS hostnames are required for AWS service endpoints (SSM, S3, etc.) to resolve correctly inside the VPC. Without this, SSM agent registration fails.
+1. **C** — The outbound-connection rendezvous model. Note D is plausible-sounding but wrong: security groups absolutely filter inbound traffic from inside the VPC too. A misframes how SSM works (subnet visibility is irrelevant). B is wrong — SSM doesn't open any ports.
+
+2. **D** — Auto-assigns public IPs to launched instances. Note A confuses Elastic IPs with auto-assigned public IPs. B and C invent behaviors that don't exist.
+
+3. **B** — The IGW route is the missing piece. Note A (NAT Gateway) is the *private subnet* solution — you already have an IGW for outbound, you just need the route. C is wrong because security groups *allow* all egress by default; the standard egress rule we wrote is redundant with the default. D is invented.
+
+4. **A** — Provider-level default_tags apply to every resource the provider creates, including those inside modules and resources added later. Note D is a common misconception — provider-level changes do affect existing resources on the next apply.
+
+5. **C** — SSM agent registration fails without DNS hostnames because the agent uses hostname-based service endpoints inside the VPC. Note A is wrong — DNS resolution and outbound internet are separate concerns. B is wrong — Terraform happily creates broken VPCs. D is invented (SGs work on IPs, not hostnames).
 
 </details>
 
@@ -985,44 +1017,54 @@ A complete IAM stack: a role that EC2 can assume, two AWS-managed policies for S
 
 ## Multiple Choice Quiz
 
-**Q1.** What is the difference between an IAM role and an IAM instance profile?
-- A) They are the same thing
-- B) A role defines permissions; an instance profile is a container that allows an EC2 instance to use the role
-- C) A role is for users; an instance profile is for services
-- D) Instance profiles have more permissions than roles
+**Q1.** You have an IAM role with the right policies attached, but EC2 won't let you assign it directly to an instance. Why not?
+- A) The role's trust policy doesn't yet trust the `ec2.amazonaws.com` service
+- B) IAM roles can only be attached to Lambda, not EC2
+- C) Roles assigned to EC2 must be wrapped in an instance profile — a separate IAM resource that exists specifically to bridge roles and EC2 instances
+- D) The role needs an inline policy granting `iam:PassRole` to itself
 
-**Q2.** Why use `sts:AssumeRole` for cross-project access instead of attaching all project permissions directly to the keep's role?
-- A) AssumeRole is faster
-- B) It enforces least privilege: each project's permissions are isolated, and credentials are short-lived
-- C) It's required by AWS
-- D) Direct attachment doesn't work across projects
+**Q2.** You're designing the keep's IAM. You can either (a) attach broad permissions for every project directly to the keep's role, or (b) give the keep's role only `sts:AssumeRole` and define separate per-project roles it can assume. Pattern (b) wins primarily because:
+- A) Pattern (a) doesn't work — IAM doesn't allow more than 10 policies per role
+- B) Pattern (b) enforces project-scoped boundaries with short-lived credentials, and CloudTrail attributes actions to the assumed role for clean per-project audit trails
+- C) Pattern (b) is faster at the API level because STS is in-region
+- D) Pattern (a) requires writing custom trust policies, which is error-prone
 
-**Q3.** What does the trust policy on `sandcastle-keep-role` define?
-- A) What the role can do
-- B) Who can assume the role (in this case, the EC2 service)
-- C) When the role expires
-- D) Which region the role works in
+**Q3.** Look at this snippet:
+```hcl
+assume_role_policy = jsonencode({
+  Statement = [{ Effect = "Allow", Principal = { Service = "ec2.amazonaws.com" }, Action = "sts:AssumeRole" }]
+})
+```
+What is this defining?
+- A) The trust relationship: who (or what) is permitted to assume the role — in this case, the EC2 service when launching an instance
+- B) Which AWS services the role's credentials can call
+- C) Which IAM users can assume the role on a developer's behalf
+- D) The session duration policy for credentials issued via assume-role
 
-**Q4.** Why prefer AWS-managed policies (like `AmazonSSMManagedInstanceCore`) over writing your own equivalent?
-- A) They're free; custom policies cost money
-- B) AWS maintains them — as the service evolves, your permissions stay correct
-- C) Custom policies don't work with EC2
-- D) Managed policies are always smaller
+**Q4.** You write a custom IAM policy that mirrors `AmazonSSMManagedInstanceCore` action-for-action. AWS later adds a new SSM feature requiring an additional permission. What happens to your two instances — one using the AWS-managed policy, one using your custom copy?
+- A) Both work fine — AWS auto-grants new SSM permissions to any role with `ssm:*` patterns
+- B) Neither works — AWS deprecates the old permission set entirely when adding features
+- C) The custom-policy instance works, because IAM uses implicit-allow for new SSM actions
+- D) The managed-policy instance works because AWS silently updates `AmazonSSMManagedInstanceCore`; the custom-policy instance breaks until you manually add the new permission
 
-**Q5.** If an attacker gained shell access to the keep but the IAM role only had `AssumeRole` permissions for `cloudhunt-dev`, what would they NOT be able to do?
-- A) Read instance metadata
-- B) Make API calls outside of CloudHunt's allowed actions
-- C) Run shell commands on the instance
-- D) Access the local filesystem
+**Q5.** An attacker gets a shell on the keep. The keep's role has only `sts:AssumeRole` for `arn:aws:iam::*:role/cloudhunt-dev`. What is the attacker **not** able to do via AWS APIs?
+- A) Read files on the keep's local filesystem
+- B) Run arbitrary shell commands on the keep
+- C) Call AWS APIs outside the CloudHunt project's scope — they can only operate as `cloudhunt-dev` and within whatever permissions that role grants
+- D) View the instance's IAM role ARN via IMDS
 
 <details>
 <summary>Answers</summary>
 
-1. **B** — A role is the permission set; an instance profile is the EC2-specific wrapper that attaches the role to an instance. You can't attach a role directly to EC2 without an instance profile.
-2. **B** — Role assumption produces short-lived (typically 1-hour) credentials and enforces explicit scope per project. Direct attachment would be permanent and over-privileged.
-3. **B** — Trust policies define *who* can assume a role. The permissions policy defines *what* the role can do.
-4. **B** — When SSM adds a new feature, AWS updates the managed policy. A custom policy you wrote a year ago wouldn't get the update.
-5. **B** — The attacker can do anything inside the OS (the role doesn't gate shell access), but their AWS API access is limited to assuming `cloudhunt-dev` and whatever that role permits — not the whole account.
+1. **C** — The instance profile wrapper. Note A confuses prerequisites (trust policy *is* needed too, but it's not what blocks attachment). B is just wrong. D invents a self-PassRole requirement.
+
+2. **B** — Boundary enforcement + audit attribution. Note A invents a 10-policy limit (real limit is 20 managed policies, irrelevant here). C is technically true but a trivial benefit. D inverts the truth — pattern (b) actually requires *more* trust policies, not fewer; that's part of the design.
+
+3. **A** — Trust policy definition. Note B describes the permissions policy. C confuses "who can assume" with "which IAM users" (here the principal is a service, not a user). D invents session duration controls (those exist but are a separate field).
+
+4. **D** — AWS manages the lifecycle of managed policies. This is the key reason to prefer managed policies for service-permissions-that-evolve. Note A, B, C invent IAM behaviors that don't exist.
+
+5. **C** — AWS API scope is constrained. Note A and B describe things the attacker *can* do (shell access doesn't go through IAM). D — the instance's role ARN is visible via IMDS by design; that's not gated.
 
 </details>
 
@@ -1220,7 +1262,7 @@ Verify it's online:
 ```bash
 aws ssm describe-instance-information \
   --filters "Key=InstanceIds,Values=$(terraform output -raw instance_id)" \
-  --profile launchpad
+  --profile sandcastle
 ```
 
 You should see your instance with `"PingStatus": "Online"`. If not, wait another 30 seconds and retry.
@@ -1228,7 +1270,7 @@ You should see your instance with `"PingStatus": "Online"`. If not, wait another
 Now connect:
 
 ```bash
-aws ssm start-session --target $(terraform output -raw instance_id) --profile launchpad
+aws ssm start-session --target $(terraform output -raw instance_id) --profile sandcastle
 ```
 
 You're in! You should see something like:
@@ -1262,7 +1304,9 @@ Create `scripts/connect.sh`:
 #!/usr/bin/env bash
 set -euo pipefail
 
-AWS_PROFILE="${AWS_PROFILE:-launchpad}"
+# Day 0 discipline: profile must be explicit. Default to sandcastle for this script
+# since it's project-specific, but error clearly if SSO token has expired.
+AWS_PROFILE="${AWS_PROFILE:-sandcastle}"
 
 INSTANCE_ID=$(terraform -chdir=terraform output -raw instance_id 2>/dev/null)
 
@@ -1325,44 +1369,48 @@ A running EC2 instance accessible via SSM Session Manager, with IMDSv2 enforced,
 
 ## Multiple Choice Quiz
 
-**Q1.** Why use the SSM Parameter Store to resolve the AMI ID instead of hardcoding it?
-- A) Hardcoded AMI IDs go stale (AWS releases new versions weekly); SSM resolves to the latest automatically
-- B) SSM is faster
-- C) Hardcoded AMIs cost more
-- D) AWS doesn't allow hardcoded AMI IDs
+**Q1.** Your Terraform pulls the AMI ID from `data.aws_ssm_parameter.al2023_ami`. A colleague proposes hardcoding the AMI ID instead, arguing "it'll be reproducible." Why is the SSM Parameter pattern the better choice for a long-lived dev environment?
+- A) Hardcoded AMIs can't be used with `lifecycle.ignore_changes`
+- B) AWS publishes new AL2023 AMI versions regularly with security patches; the SSM parameter always resolves to the current one, so new instances boot with the latest patched image
+- C) Hardcoded AMIs work only within the region where they were created
+- D) The SSM Parameter Store charges nothing for parameter reads; hardcoded AMIs trigger a per-instance lookup fee
 
-**Q2.** What does `http_tokens = "required"` do?
-- A) Requires HTTPS for all metadata requests
-- B) Enforces IMDSv2 — token-based metadata access only, blocking IMDSv1 SSRF attacks
-- C) Encrypts the metadata
-- D) Disables the metadata service
+**Q2.** What does `http_tokens = "required"` in the EC2 instance's `metadata_options` actually enforce?
+- A) HTTPS for all instance metadata service requests (TLS encryption end-to-end)
+- B) Token-based authentication for AWS API calls made from the instance
+- C) Mutual TLS between the SSM agent and the SSM service
+- D) IMDSv2 only: every metadata request must include a session token obtained via a `PUT` to `/latest/api/token`, which blocks SSRF-style credential theft because attackers can't forge a `PUT` through a vulnerable application
 
-**Q3.** Why does the security group have no inbound rules, yet you can still connect to the instance?
-- A) SSM agent on the instance opens an outbound connection to the SSM service; your "session" is proxied through AWS
-- B) The default rule allows your IP
-- C) SSM requires no security group
-- D) Public IPs bypass security groups
+**Q3.** You launched an EC2 instance in a public subnet with `map_public_ip_on_launch = true`. The security group has zero inbound rules. How does SSM Session Manager get a shell to you?
+- A) AWS Console proxies the shell through your instance's public IP; security groups don't apply to AWS-managed services
+- B) The instance's `metadata_options` block opens a backchannel for SSM
+- C) The SSM agent on the instance maintains an outbound WebSocket to the SSM regional endpoint over the public IP; your console session is proxied through that pre-existing outbound connection
+- D) SSM uses a special "management ENI" that bypasses the user's security groups
 
-**Q4.** Why is the `ignore_changes = [ami]` lifecycle rule on the instance important?
-- A) Without it, every time AWS publishes a new AL2023 AMI, Terraform would want to recreate the instance — wiping the disk
-- B) It speeds up Terraform
-- C) It's required for SSM
-- D) It prevents tagging changes
+**Q4.** The `lifecycle { ignore_changes = [ami] }` block on your `aws_instance` exists because:
+- A) Without it, every `terraform apply` would trigger an instance replacement whenever the SSM-resolved AMI updates — destroying the running OS and any in-flight work on the EBS root volume
+- B) Terraform's diff engine doesn't understand AMI IDs and would otherwise error out
+- C) The AWS provider explicitly requires it for SSM-resolved AMIs
+- D) Without it, the instance can't be stopped and started — only terminated
 
-**Q5.** What happens to the EBS volume when the instance is stopped?
-- A) It's deleted
-- B) It persists; data is preserved
-- C) It's snapshotted
-- D) It's detached
+**Q5.** Your `t3.medium` instance has a `gp3` root EBS volume. You run `aws ec2 stop-instances` to save money overnight. What happens to your data the next morning when you start the instance?
+- A) The volume is detached at stop and reattached at start; data persists but the volume ID changes
+- B) The volume is snapshotted at stop and restored at start (paid as snapshot storage between stop and start)
+- C) Nothing happens to the volume — EBS storage is independent of instance run state; your data is exactly where you left it
+- D) The volume is wiped because gp3 volumes are ephemeral by default
 
 <details>
 <summary>Answers</summary>
 
-1. **A** — AMI IDs change frequently as AWS publishes security patches. The SSM Parameter pattern is the industry-standard way to always get the current image.
-2. **B** — IMDSv2 requires a session token (obtained via PUT, which SSRF can't forge), making credential theft via metadata-service exploits much harder.
-3. **A** — SSM Session Manager works through outbound-initiated WebSocket connections from the SSM agent. No inbound port needed.
-4. **A** — Without `ignore_changes`, every AMI update Terraform sees would trigger an instance replacement, destroying the EBS volume in the process. This is one of the most common production-disaster patterns in Terraform.
-5. **B** — EBS volumes are durable and independent of instance state. Stopping the instance doesn't affect the disk; only terminating with `delete_on_termination=true` removes it.
+1. **B** — Patch currency. Note A invents a `lifecycle` constraint. C is wrong — both AMI IDs and SSM parameters are region-scoped, that's not a differentiator. D invents a fee that doesn't exist (Parameter Store standard tier is free).
+
+2. **D** — IMDSv2 mechanics. Note A confuses transport encryption (TLS) with the session-token model. B and C invent unrelated authentication scopes.
+
+3. **C** — Outbound-initiated rendezvous. Note A is wrong about security groups (they absolutely apply to all traffic including AWS-managed). B confuses metadata service with SSM. D invents a "management ENI."
+
+4. **A** — Avoiding destructive replacement on AMI updates. Note B, C, D invent constraints that don't exist.
+
+5. **C** — EBS persistence model. Note A is wrong — the volume stays attached at stop, and the volume ID doesn't change. B confuses EBS with instance-store. D invents a "gp3 is ephemeral" claim that's the opposite of reality.
 
 </details>
 
@@ -1672,44 +1720,48 @@ Reproducible first-boot toolchain installation. Every rebuild of the keep produc
 
 ## Multiple Choice Quiz
 
-**Q1.** When does EC2 user data run by default?
-- A) On every boot
-- B) Only on the first boot of an instance
-- C) When the user runs it manually
-- D) When the SSM agent triggers it
+**Q1.** You add a new package install to the user data script and run `terraform apply`. The instance keeps running with the *old* configuration. Why?
+- A) The SSM agent caches the user data and serves the cached version
+- B) User data only runs on first boot. The existing instance is past first boot, so the change is inert until you replace the instance (or set `user_data_replace_on_change = true`)
+- C) Terraform applies the user data change asynchronously over the next 24 hours
+- D) Cloud-init refuses to re-run user data once a successful boot is recorded in `/var/lib/cloud/instances/`
 
-**Q2.** Why does the bootstrap script run as root?
-- A) User data always runs as root by default
-- B) Only root can install system packages
-- C) Both A and B
-- D) Neither
+**Q2.** Cloud-init executes user data as which user, and why does that matter for your bootstrap script?
+- A) As `ec2-user` (the default login user), which means `sudo` is required for any system-level operation
+- B) As an isolated `cloud-init` system user, requiring you to write SUID binaries for privileged operations
+- C) As root, because cloud-init runs early in the boot sequence before user logins exist; system package installs (which require root) work directly without `sudo`
+- D) As whichever user the SSM agent was registered with; this defaults to `ec2-user` on AL2023
 
-**Q3.** What's the purpose of `user_data_replace_on_change = true`?
-- A) Reruns user data on the existing instance
-- B) Replaces the instance when user data changes, so the new script actually runs
-- C) Makes user data optional
-- D) Improves performance
+**Q3.** You add `user_data_replace_on_change = true` to your `aws_instance`. You change the user data script and run `terraform apply`. What happens?
+- A) Terraform destroys the existing instance and creates a new one — the new instance boots fresh and runs the updated user data as part of its first boot
+- B) The existing instance reboots and re-runs user data
+- C) Terraform refuses to apply, since user data changes are destructive
+- D) Cloud-init detects the new script via IMDS and re-executes it without instance replacement
 
-**Q4.** Why is idempotency important in a bootstrap script?
-- A) AWS requires it
-- B) So the script can be safely re-run without breaking or duplicating installs
-- C) It's faster
-- D) It enables logging
+**Q4.** Your bootstrap script installs Docker. You run the script a second time on the same instance (for testing). Without idempotency, what's the most likely real-world failure?
+- A) The script fails partway through because the second `apt-get install docker.io` errors on the already-installed package
+- B) The script duplicates Docker, leaving two installations
+- C) Cloud-init blocks repeated execution to prevent corruption
+- D) The script silently corrupts the Docker installation by re-running setup steps that assume a clean state — like adding a user to the `docker` group twice or appending duplicate lines to config files
 
-**Q5.** What's the purpose of the `/var/log/sandcastle-bootstrap.complete` marker file?
-- A) Required by cloud-init
-- B) Gives you a quick way to verify the bootstrap finished successfully without parsing log files
-- C) Triggers a CloudWatch alarm
-- D) Required by SSM
+**Q5.** Why does the bootstrap script `touch /var/log/sandcastle-bootstrap.complete` at the very end?
+- A) Cloud-init requires a completion marker to flag boot as successful
+- B) SSM Session Manager won't allow connections until this file exists
+- C) It's a simple, idempotent boolean check: a quick `ls` on the file tells you the script ran end-to-end, without needing to grep through 500 lines of cloud-init logs
+- D) The CloudWatch agent watches this file and emits a metric when it appears
 
 <details>
 <summary>Answers</summary>
 
-1. **C** — User data runs once on first boot. Subsequent boots don't re-run it unless explicitly configured. This is a deliberate design choice — re-running install scripts on every boot would be slow and risky.
-2. **C** — Both. Cloud-init runs user data as root by default, and installing system packages requires root.
-3. **B** — User data only takes effect on first boot. If you change the script but don't replace the instance, the change does nothing. This flag enforces "user data is part of the instance's identity."
-4. **B** — During development you'll re-run the script while debugging. Idempotent guards (`if ! command -v ...`) make this safe.
-5. **B** — When something goes wrong, you want a quick boolean answer to "did the bootstrap finish?" The marker file gives you that without scrolling through hundreds of log lines.
+1. **B** — User data runs only on first boot. Note A invents SSM caching behavior. C invents an asynchronous-apply behavior. D is half-true (cloud-init does check `/var/lib/cloud/instances/`) but framed misleadingly — the issue isn't cloud-init refusing, it's that Terraform doesn't pass the new user data to the existing instance at all.
+
+2. **C** — Root by default. Note A is the post-boot login user, not the cloud-init context. B and D are invented.
+
+3. **A** — Instance replacement. Note B is the *desired* behavior, but not what actually happens — user data really does only run on first boot. C is wrong, Terraform doesn't refuse. D is invented.
+
+4. **D** — The silent-corruption failure mode. Note A is plausible-sounding but wrong: `apt-get install` on an already-installed package is a no-op, it doesn't error. The real risks are appending-twice or group-membership-twice bugs.
+
+5. **C** — Simple operational signal. Note A, B, D invent dependencies that don't exist. The marker is just a convention you make yourself for fast verification.
 
 </details>
 
@@ -1818,11 +1870,19 @@ cat > ~/.aws/config <<'EOF'
 region = us-east-1
 credential_source = Ec2InstanceMetadata
 
-[profile launchpad]
+[profile cloudhunt]
 region = us-east-1
 credential_source = Ec2InstanceMetadata
 EOF
 ```
+
+**Note on profile naming**: These profile names live only on the keep — they're not the same as your laptop's SSO profiles (which are `sandcastle`, `cloudhunt`, `launchpad-sso`, `playhowzat` per Day 0). The keep uses `credential_source = Ec2InstanceMetadata`, which gets credentials from the keep's instance profile, not from any SSO session. The profile names here just give CloudHunt's Terraform a name to reference.
+
+**Heads-up on existing CloudHunt code**: Your existing CloudHunt Terraform may still reference `--profile launchpad` from before Day 0. If it does, you have two clean options:
+1. Update the CloudHunt repo to use `cloudhunt` consistently (recommended — matches Day 0 naming everywhere)
+2. Add a `[profile launchpad]` stanza to the keep's config as a temporary alias while you migrate CloudHunt
+
+Track this as tech debt in CloudHunt's `LEARNINGS.md`.
 
 **Note**: Right now your IAM role only has SSM + CloudWatch + AssumeRole permissions. For CloudHunt's Terraform to actually plan/apply, you'd either need to (a) broaden the keep's role temporarily, or (b) create a `cloudhunt-dev` role and add its ARN to `project_role_arns` in the IAM module. For today's exercise, just confirm that `terraform init` works (it only needs S3 + DynamoDB access for state). Full project apply is a future task.
 
@@ -1897,44 +1957,48 @@ CloudHunt running from inside SandCastle. Git, SSH keys, VS Code Remote-Tunnels 
 
 ## Multiple Choice Quiz
 
-**Q1.** Why generate a *new* SSH key on the keep instead of copying your laptop's key?
-- A) Faster
-- B) The key on the keep can be revoked independently if the keep is compromised, without affecting your laptop
-- C) AWS requires it
-- D) SSH keys can't be transferred
+**Q1.** You're cloning CloudHunt onto the keep via Git. Instead of copying your laptop's SSH key over, you generate a fresh keypair on the keep and add the public key to GitHub. The primary security benefit is:
+- A) GitHub rate-limits clones from reused keys, so a fresh key is faster
+- B) GitHub requires unique keys per host
+- C) Per-host keys give you per-host revocation: if the keep is compromised or decommissioned, you remove one GitHub-registered key without touching your laptop's access
+- D) Fresh keys use a stronger algorithm than older laptop keys by default
 
-**Q2.** What does `credential_source = Ec2InstanceMetadata` in `~/.aws/config` do?
-- A) Reads credentials from a file
-- B) Tells the AWS SDK to fetch credentials from the EC2 instance metadata service
-- C) Disables credentials
-- D) Encrypts credentials
+**Q2.** Your `~/.aws/config` on the keep includes `credential_source = Ec2InstanceMetadata`. What does this line cause the AWS SDK / CLI to do?
+- A) Read AWS credentials from `~/.aws/credentials` and fall back to IMDS if the file is missing
+- B) Skip the credentials file entirely and fetch credentials directly from the EC2 Instance Metadata Service (IMDSv2), which serves short-lived credentials minted from the instance profile's role
+- C) Use the AWS SSO session cached on the keep (matching the laptop's SSO model)
+- D) Pull credentials from AWS Secrets Manager using the instance's IAM role
 
-**Q3.** Why does VS Code Remote-Tunnels work even with no inbound ports open on the keep?
-- A) It uses a magic AWS feature
-- B) The tunnel is outbound-initiated; the keep connects to Microsoft's tunnel service, your laptop connects to the same service
-- C) It bypasses security groups
-- D) Tunnels require port 443 to be open
+**Q3.** You install VS Code Remote-Tunnels on the keep, run `code tunnel`, and on your laptop connect to the same tunnel. No inbound port is open on the keep's security group. How does this work?
+- A) Microsoft's tunnel service runs over UDP, which bypasses TCP-based security groups
+- B) VS Code's tunnel auto-creates a transient inbound rule in your security group at session start
+- C) The tunnel uses ICMP, which security groups treat as always-allow
+- D) The tunnel uses an outbound-initiated WebSocket from the keep to Microsoft's relay service; your laptop also connects outbound to the same service. Both sides connect *out*, the service brokers the rendezvous — same pattern as SSM Session Manager, ngrok, and Tailscale
 
-**Q4.** What's the risk of putting static AWS access keys on the keep instead of using the instance profile?
-- A) No risk
-- B) If the keep is compromised or snapshotted, those keys leak; rotating them is manual
-- C) Static keys are faster
-- D) Static keys don't work on EC2
+**Q4.** Imagine you put long-lived IAM access keys in `~/.aws/credentials` on the keep instead of relying on `credential_source = Ec2InstanceMetadata`. What's the realistic risk profile?
+- A) Slower API calls because static keys require an extra STS exchange on each request
+- B) The keys are stored cleartext on disk; an EBS snapshot, a misconfigured backup, or a compromised process running as your user can read them. Rotation is manual and tied to your discipline, not AWS's
+- C) AWS will alert you within minutes if static keys are present on an EC2 instance
+- D) Static keys silently expire after 72 hours, breaking your tooling unannounced
 
-**Q5.** Why is `pre-commit install` important for the cloned CloudHunt repo?
-- A) It's not — pre-commit is optional
-- B) It re-installs the git hooks locally so the project's quality checks run on every commit
-- C) It downloads dependencies
-- D) It re-initializes Terraform
+**Q5.** You clone a repo with a `.pre-commit-config.yaml` file onto the keep. The hooks (e.g., `terraform fmt`, `yamllint`) don't run when you commit. Why?
+- A) The repo's `.git/hooks/` directory wasn't included in the clone — pre-commit hooks are installed locally per checkout, not stored in the repo itself. You need to run `pre-commit install` on the keep to register them
+- B) Git ignores pre-commit hooks for SSM-connected sessions
+- C) `terraform fmt` requires write permissions to the IAM role
+- D) Pre-commit only works inside a Python virtualenv
 
 <details>
 <summary>Answers</summary>
 
-1. **B** — Defense in depth. Independent keys mean a compromise of one machine doesn't compromise GitHub access from other machines.
-2. **B** — This tells the SDK to use IMDS for credentials, which gets short-lived, rotating creds from the instance profile.
-3. **B** — Outbound-initiated rendezvous through a third-party service. Same pattern as SSM, ngrok, Tailscale, etc.
-4. **B** — Static keys at rest are a leak waiting to happen. Instance profile creds rotate automatically and exist only in memory.
-5. **B** — Pre-commit hooks are stored per-checkout (in `.git/hooks/`), not in the repo. Cloning gets the *config* but not the installed hooks. `pre-commit install` activates them.
+1. **C** — Per-host revocation. Note A, B, D invent constraints that don't exist.
+
+2. **B** — IMDS credential source. Note A misframes the precedence (this directive *replaces* the credentials file, doesn't fall back to it). C is wrong — SSO isn't involved on the keep. D invents Secrets Manager involvement.
+
+3. **D** — Outbound rendezvous pattern. Note A is wrong (the tunnel uses TCP/WebSocket over 443). B invents auto-rule creation that would be a security disaster if true. C invents an ICMP-based approach.
+
+4. **B** — Cleartext-on-disk risk. Note A invents a performance claim. C invents an AWS alerting feature (GuardDuty does flag *exposed* keys but not just on-disk presence). D invents an auto-expiry that doesn't exist.
+
+5. **A** — pre-commit hooks are per-checkout. Note B, C, D invent constraints.
 
 </details>
 
@@ -1980,7 +2044,7 @@ From your laptop:
 ```bash
 aws resourcegroupstaggingapi get-resources \
   --tag-filters "Key=Project,Values=sandcastle" \
-  --profile launchpad \
+  --profile sandcastle \
   --query 'ResourceTagMappingList[*].[ResourceARN]' \
   --output table
 ```
@@ -2021,7 +2085,7 @@ output "instance_profile_name" {
 
 output "ssm_connect_command" {
   description = "Run this to connect via SSM"
-  value       = "aws ssm start-session --target ${module.compute.instance_id} --profile launchpad"
+  value       = "aws ssm start-session --target ${module.compute.instance_id} --profile sandcastle"
 }
 ```
 
@@ -2091,7 +2155,7 @@ aws ce get-cost-and-usage \
   --granularity DAILY \
   --metrics UnblendedCost \
   --filter '{"Tags": {"Key": "Project", "Values": ["sandcastle"]}}' \
-  --profile launchpad
+  --profile sandcastle
 ```
 
 You should see daily costs around $1 (since you've been running 24/7 during the build). This confirms cost allocation tagging is working.
@@ -2102,8 +2166,8 @@ On your laptop, add this to `~/.bashrc` or `~/.zshrc`:
 
 ```bash
 alias castle='cd ~/dev/sandcastle && ./scripts/connect.sh'
-alias castle-up='aws ec2 start-instances --instance-ids $(terraform -chdir=$HOME/dev/sandcastle/terraform output -raw instance_id) --profile launchpad'
-alias castle-down='aws ec2 stop-instances --instance-ids $(terraform -chdir=$HOME/dev/sandcastle/terraform output -raw instance_id) --profile launchpad'
+alias castle-up='aws ec2 start-instances --instance-ids $(terraform -chdir=$HOME/dev/sandcastle/terraform output -raw instance_id) --profile sandcastle'
+alias castle-down='aws ec2 stop-instances --instance-ids $(terraform -chdir=$HOME/dev/sandcastle/terraform output -raw instance_id) --profile sandcastle'
 ```
 
 Now `castle` connects you in one word.
@@ -2124,44 +2188,48 @@ A fully working, documented, portfolio-grade personal AWS development environmen
 
 ## End-of-Phase Quiz (Cumulative)
 
-**Q1.** What is the single most important security control in SandCastle's design?
-- A) Encrypted EBS volumes
-- B) IMDSv2 enforcement
-- C) Zero inbound rules on the security group (combined with SSM access)
-- D) CloudTrail logging
+**Q1.** An interviewer asks: "Of all the security controls in SandCastle's design — encrypted EBS, IMDSv2 enforcement, zero-ingress security group, CloudTrail logging, instance-profile-only credentials — which one provides the most fundamental protection, and why?" The strongest answer is:
+- A) Encrypted EBS volumes, because data-at-rest is the foundation of every modern security framework
+- B) IMDSv2 enforcement, because SSRF is the most common cloud-native attack vector
+- C) CloudTrail logging, because without an audit trail you can't detect or respond to incidents
+- D) Zero-ingress security group paired with SSM access, because eliminating the network attack surface entirely means there's nothing to attack remotely; every other control is defense-in-depth for an attack that can't reach the box in the first place
 
-**Q2.** Why is the auto-stop Lambda (Phase 2) the single biggest cost driver?
-- A) Lambda is expensive
-- B) It reduces EC2 compute hours by ~75%, the dominant cost line
-- C) It eliminates EBS cost
-- D) It eliminates data transfer cost
+**Q2.** Phase 2 will add an EventBridge schedule + auto-stop Lambda to shut the keep down on a fixed schedule. From the cost analysis we did, why is this the single largest cost lever in SandCastle?
+- A) Lambda execution itself drives most cloud costs at small scale
+- B) EC2 compute is roughly 80% of the always-on bill; cutting runtime by ~75% directly compresses that dominant line item. EBS, data transfer, and Lambda are all minor by comparison.
+- C) Auto-stop eliminates the EBS volume between sessions, removing the second-biggest cost line
+- D) Stopping the instance pauses data transfer charges that would otherwise accumulate continuously
 
-**Q3.** Which of these are true of using SSM Session Manager? (Multiple correct.)
-- A) Requires no inbound security group rules
-- B) Provides full audit logging to CloudTrail
-- C) Uses temporary credentials, not long-lived keys
-- D) Requires port 22 open
+**Q3.** Which of the following are *true* statements about SSM Session Manager? (Select all that apply.)
+- A) It requires no inbound rules on the instance's security group; the SSM agent maintains an outbound connection to AWS
+- B) It logs every session to CloudTrail with the IAM principal who started it
+- C) Credentials used by the SSM agent are short-lived, rotating creds derived from the instance profile — no long-lived keys involved
+- D) It requires port 22 to be open inbound to the instance
 
-**Q4.** When you change the user data script and `terraform apply`, what happens?
-- A) Nothing (user data only runs on first boot)
-- B) The script re-runs on the existing instance
-- C) Terraform replaces the instance (because `user_data_replace_on_change = true`)
-- D) Terraform errors out
+**Q4.** You add a single line to your user data script and run `terraform apply`. Your `aws_instance` resource has `user_data_replace_on_change = true`. What happens to the running instance?
+- A) Nothing — user data only runs on first boot, and Terraform's diff engine ignores user data changes by default
+- B) Terraform sends the new script to the running instance via SSM, which executes it as root
+- C) The instance is terminated and a new one is launched in its place; the new instance boots fresh and executes the updated user data as part of cloud-init's first-boot routine
+- D) Terraform errors out because user data changes are non-idempotent
 
-**Q5.** What is the principle of least privilege?
-- A) Granting users the maximum permissions they might ever need
-- B) Granting users only the permissions required for their current task, and no more
-- C) Restricting access to admin users only
-- D) Using only AWS-managed policies
+**Q5.** Define the principle of least privilege as it applies to your SandCastle IAM design:
+- A) Granting each principal only the permissions strictly required for their current task — for example, the keep's role having only `sts:AssumeRole` for specific per-project roles, rather than account-wide admin access
+- B) Restricting AWS Console access to admin users only; CLI access is unrestricted
+- C) Using only AWS-managed policies, never inline or customer-managed policies
+- D) Granting the maximum permissions a principal might plausibly need over its lifetime, then auditing usage to identify what can be removed
 
 <details>
 <summary>Answers</summary>
 
-1. **C** — Zero ingress means there's nothing to attack on the network surface. Every other control is defense in depth.
-2. **B** — EC2 compute is ~80% of the bill at always-on. Cutting hours by 75% drops the dominant line.
-3. **A, B, C** — All three are core SSM benefits. D is the *opposite* of what SSM enables.
-4. **C** — With `user_data_replace_on_change = true`, Terraform replaces the instance. Otherwise (default behavior) the user data change is ignored.
-5. **B** — Classic security principle. The opposite (A) is the most common cause of catastrophic IAM-related breaches.
+1. **D** — Network attack surface elimination. The point: zero ingress is *categorically* different from other controls. Encryption (A) protects against a specific exfiltration path, IMDSv2 (B) protects against a specific vulnerability class, CloudTrail (C) is detective-not-preventive. Zero ingress means there's no entry point to defend in the first place — every other control becomes a backup.
+
+2. **B** — Compute is the dominant line. Note A is wrong (Lambda is fractions of a cent here). C invents an EBS-on-stop behavior — EBS keeps billing whether the instance is running or stopped, so auto-stop doesn't help EBS cost. D invents an idle-data-transfer charge.
+
+3. **A, B, C** — All three are core SSM properties. D is the *opposite* of how SSM works: SSM exists specifically to remove the need for port 22.
+
+4. **C** — Instance replacement. Note A is the *default* behavior (which is exactly why `user_data_replace_on_change = true` exists). B invents an SSM-based user-data redelivery mechanism. D is wrong — Terraform applies happily.
+
+5. **A** — Classic least-privilege definition applied to the keep's role design. Note B confuses interface restriction with permission scoping. C overconstrains the principle (managed policies are a tactic, not the principle itself). D is the *opposite* of least privilege — that's "trust then verify" or "audit-driven reduction," which is a different model.
 
 </details>
 
