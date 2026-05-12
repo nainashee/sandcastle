@@ -1,0 +1,114 @@
+# =============================================================================
+# Terraform
+# =============================================================================
+# Local .terraform directories
+**/.terraform/*
+
+# .tfstate files (state should be remote; never commit state)
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Crash log files
+crash.log
+crash.*.log
+
+# Variable files that may contain secrets or environment-specific values
+# Commit terraform.tfvars.example instead
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+# Override files (typically used for local-only customization)
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# CLI configuration files
+.terraformrc
+terraform.rc
+
+# Lock file backup
+.terraform.lock.hcl.bak
+
+# =============================================================================
+# Lambda build artifacts
+# =============================================================================
+lambda/**/build/
+lambda/**/dist/
+lambda/**/*.zip
+lambda/**/__pycache__/
+lambda/**/*.pyc
+
+# =============================================================================
+# Python
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+.env
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.coverage
+htmlcov/
+
+# =============================================================================
+# Node (if any tooling uses it)
+# =============================================================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+.yarn-integrity
+
+# =============================================================================
+# Operating Systems
+# =============================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# =============================================================================
+# Editors and IDEs
+# =============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# =============================================================================
+# Local environment and secrets
+# =============================================================================
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+.aws/
+credentials
+config
+
+# =============================================================================
+# Local notes that shouldn't be public
+# =============================================================================
+NOTES.local.md
+TODO.local.md
+scratch/
+.scratch/
