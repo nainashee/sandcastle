@@ -16,7 +16,7 @@
 
 | Day | Topic | Deliverable |
 |-----|-------|-------------|
-| 1 | Repo scaffolding + Terraform state backend | `nainashee/sandcastle` repo + S3 state bucket + DynamoDB lock table |
+| 1 | Repo scaffolding + Terraform state backend | `nainashee/sandcastle` repo + S3 state bucket (with native locking via `use_lockfile`) |
 | 2 | Terraform basics + VPC and networking | `terraform/modules/networking/` working |
 | 3 | IAM roles, policies, and instance profiles | `terraform/modules/iam/` working |
 | 4 | EC2 instance with SSM | Instance running, SSM session works |
@@ -39,17 +39,19 @@
 
 ## Why we're doing this today
 
-Every serious Terraform project has a problem called "the chicken and the egg." Terraform stores its state (a JSON file that tracks what it has created) in a backend — usually an S3 bucket with a DynamoDB lock table. But that S3 bucket and DynamoDB table need to exist *before* Terraform can use them. So you can't create them with the same Terraform that depends on them.
+Every serious Terraform project has a problem called "the chicken and the egg." Terraform stores its state (a JSON file that tracks what it has created) in a backend — an S3 bucket. But that S3 bucket needs to exist *before* Terraform can use it. So you can't create it with the same Terraform that depends on it.
 
 The solution is a one-time bootstrap: create the state backend manually (via a shell script with AWS CLI commands), then everything else gets managed by Terraform. You only do this once per project.
 
 This is also why your CloudHunt project has a bucket called `jobhunt-terraform-state-989126024881` — that bucket was created outside of Terraform first, so Terraform could use it for everything else.
 
+> **Why no DynamoDB lock table?** Historically, the standard Terraform S3 backend pattern was "S3 bucket + DynamoDB lock table." DynamoDB was used for locking because S3 didn't support the atomic conditional writes locking requires. As of Terraform 1.10 (late 2024), S3 itself supports conditional writes, so the backend can use a `.tflock` file in the same bucket via `use_lockfile = true`. For a single-user dev environment like SandCastle, this is the right call — one fewer resource to bootstrap, one fewer IAM permission set to maintain, and no separate lock-table cost. DynamoDB locking is still the right call for team environments because it stores richer lock metadata and supports TTL-based stale lock cleanup. CloudHunt uses DynamoDB locking; SandCastle uses S3 native locking. Owning both patterns is the actual portfolio value.
+
 Today you're building the bootstrap script and the empty repo skeleton. You're learning:
 
 - **Why state matters**: Without state, Terraform doesn't know what already exists in AWS. Lose your state, and Terraform thinks nothing exists and tries to recreate everything (disaster).
 - **Why remote state matters**: If state lives only on your laptop, no one else (including future-you on a different machine) can manage the infrastructure. Remote state in S3 solves that.
-- **Why locking matters**: If two `terraform apply` commands run at the same time on the same state, you corrupt the state file. DynamoDB locks prevent this.
+- **Why locking matters**: If two `terraform apply` commands run at the same time on the same state, you corrupt the state file. State locks prevent this. SandCastle uses S3 native locking (`use_lockfile = true`, Terraform 1.10+); the older pattern uses a DynamoDB table — same goal, different mechanism.
 
 ## Step 1: Create the GitHub repository (5 min)
 
@@ -142,7 +144,8 @@ Create `bootstrap/bootstrap-state-backend.sh`:
 #
 # bootstrap-state-backend.sh
 # One-time setup of the Terraform state backend for SandCastle.
-# Creates an S3 bucket (versioned, encrypted) and a DynamoDB lock table.
+# Creates a single S3 bucket (versioned, encrypted) used for both
+# state storage and native state locking (Terraform 1.10+ feature).
 #
 # Run this ONCE, before the first `terraform init`.
 # Idempotent: safe to run multiple times.
@@ -166,14 +169,13 @@ fi
 # Account ID is appended for global S3 bucket uniqueness
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --profile "$AWS_PROFILE")
 BUCKET_NAME="${PROJECT_NAME}-terraform-state-${ACCOUNT_ID}"
-LOCK_TABLE_NAME="${PROJECT_NAME}-terraform-lock"
 
 echo "==> SandCastle state backend bootstrap"
-echo "    Region:     $AWS_REGION"
-echo "    Profile:    $AWS_PROFILE"
-echo "    Account:    $ACCOUNT_ID"
-echo "    Bucket:     $BUCKET_NAME"
-echo "    Lock table: $LOCK_TABLE_NAME"
+echo "    Region:   $AWS_REGION"
+echo "    Profile:  $AWS_PROFILE"
+echo "    Account:  $ACCOUNT_ID"
+echo "    Bucket:   $BUCKET_NAME"
+echo "    Locking:  S3 native (use_lockfile=true) — no DynamoDB table needed"
 echo ""
 
 # ---- S3 Bucket ----
@@ -223,41 +225,18 @@ aws s3api put-bucket-tagging \
   ]' \
   --profile "$AWS_PROFILE"
 
-# ---- DynamoDB Lock Table ----
-echo "==> Creating DynamoDB lock table..."
-if aws dynamodb describe-table --table-name "$LOCK_TABLE_NAME" --profile "$AWS_PROFILE" --region "$AWS_REGION" 2>/dev/null; then
-  echo "    Lock table already exists. Skipping creation."
-else
-  aws dynamodb create-table \
-    --table-name "$LOCK_TABLE_NAME" \
-    --attribute-definitions AttributeName=LockID,AttributeType=S \
-    --key-schema AttributeName=LockID,KeyType=HASH \
-    --billing-mode PAY_PER_REQUEST \
-    --tags \
-      Key=Project,Value=sandcastle \
-      Key=Owner,Value=hussain \
-      Key=ManagedBy,Value=bootstrap-script \
-    --region "$AWS_REGION" \
-    --profile "$AWS_PROFILE"
-
-  echo "==> Waiting for lock table to become active..."
-  aws dynamodb wait table-exists \
-    --table-name "$LOCK_TABLE_NAME" \
-    --region "$AWS_REGION" \
-    --profile "$AWS_PROFILE"
-  echo "    Lock table is active."
-fi
-
 echo ""
 echo "==> Done. Add this to terraform/backend.tf:"
 echo ""
 echo 'terraform {'
+echo '  required_version = ">= 1.10"'
+echo ''
 echo '  backend "s3" {'
-echo "    bucket         = \"$BUCKET_NAME\""
-echo '    key            = "phase-1/terraform.tfstate"'
-echo "    region         = \"$AWS_REGION\""
-echo "    dynamodb_table = \"$LOCK_TABLE_NAME\""
-echo '    encrypt        = true'
+echo "    bucket       = \"$BUCKET_NAME\""
+echo '    key          = "phase-1/terraform.tfstate"'
+echo "    region       = \"$AWS_REGION\""
+echo '    encrypt      = true'
+echo '    use_lockfile = true'
 echo '  }'
 echo '}'
 ```
@@ -273,7 +252,7 @@ chmod +x bootstrap/bootstrap-state-backend.sh
 - **Versioning**: If state gets corrupted (it happens), you can roll back to a previous version. This is your insurance policy.
 - **Encryption**: State files contain ARNs, resource IDs, and sometimes embedded secrets. Encryption is a default control with zero cost.
 - **Block public access**: A public state bucket is a catastrophic leak. This is belt-and-suspenders — even if a future policy is misconfigured, this account-level block stays in effect.
-- **PAY_PER_REQUEST DynamoDB billing**: For locks (a handful of writes per day), pay-per-request is cheaper than provisioned capacity. You don't need capacity planning for a lock table.
+- **No DynamoDB lock table**: SandCastle uses Terraform 1.10+'s `use_lockfile = true` flag, which creates a small `.tflock` object in the same S3 bucket whenever a state-touching command runs. S3's conditional-write support (the `If-None-Match` header) makes this atomic and safe. One fewer resource to manage, one fewer cost line, and a chance to articulate *why* you chose the modern pattern in an interview.
 
 ## Step 5: Run the bootstrap (5 min)
 
@@ -286,7 +265,7 @@ Expected output ends with the `backend "s3"` block that you'll use tomorrow.
 ## Step 6: Verify in AWS Console (5 min)
 
 - Go to S3 console → confirm `sandcastle-terraform-state-989126024881` exists with versioning enabled
-- Go to DynamoDB console → confirm `sandcastle-terraform-lock` is in "Active" state
+- Inside the bucket, confirm that no `.tflock` object exists yet (it will appear the first time you run `terraform plan` or `apply`, and disappear after it completes)
 
 **Why verify visually?** Because automation can silently fail in subtle ways. Eyeballing the actual resources catches things the script's exit code missed.
 
@@ -300,7 +279,7 @@ git push -u origin main
 
 ## What You Built Today
 
-A reproducible Terraform state backend (S3 + DynamoDB) created via a single shell script, plus the repo scaffolding for everything else.
+A reproducible Terraform state backend (S3 with native locking via `use_lockfile`) created via a single shell script, plus the repo scaffolding for everything else.
 
 ## End-of-Day Reflection
 
@@ -309,7 +288,7 @@ Add to `LEARNINGS.md`:
 ```markdown
 ## YYYY-MM-DD — Day 1: State backend bootstrap
 
-**What I built**: S3 state bucket with versioning + encryption, DynamoDB lock table, repo scaffolding.
+**What I built**: S3 state bucket with versioning + encryption + native locking (`use_lockfile`), repo scaffolding. Deliberately did not create a DynamoDB lock table — chose the modern S3-only pattern instead.
 
 **What I learned**: [your words]
 
@@ -320,13 +299,13 @@ Add to `LEARNINGS.md`:
 
 ## Multiple Choice Quiz
 
-**Q1.** Why does the Terraform state backend (S3 + DynamoDB) need to be created *outside* of Terraform?
+**Q1.** Why does the Terraform state backend (the S3 bucket for SandCastle, or S3 + DynamoDB for the traditional pattern) need to be created *outside* of Terraform?
 - A) AWS rate-limits backend resource creation when done via Terraform
 - B) The S3 bucket can technically be created by Terraform, but the DynamoDB lock table cannot
 - C) The state backend must exist before `terraform init` can use it; you can't store state in a bucket Terraform hasn't created yet
 - D) Terraform doesn't support S3 buckets in its AWS provider
 
-**Q2.** Two engineers run `terraform apply` against the same state file at the same time, without a lock table configured. What's the most likely outcome?
+**Q2.** Two engineers run `terraform apply` against the same state file at the same time, without any locking mechanism configured. What's the most likely outcome?
 - A) State corruption: one apply overwrites the other's state, leaving Terraform's view out of sync with AWS reality
 - B) The second `apply` queues automatically and runs after the first finishes
 - C) Both applies succeed cleanly because S3 versioning resolves the conflict
@@ -344,24 +323,24 @@ Add to `LEARNINGS.md`:
 - C) `IgnorePublicAcls`
 - D) `RestrictPublicBuckets`
 
-**Q5.** You're choosing between `PAY_PER_REQUEST` and `PROVISIONED` (with 5 RCU/5 WCU) billing for the Terraform lock table. The lock table sees roughly 20 read/write operations per day. Why is `PAY_PER_REQUEST` the right call?
-- A) `PAY_PER_REQUEST` has no minimum monthly cost and scales to zero between applies; provisioned would bill 24/7 for capacity you barely use
-- B) Provisioned capacity has a 25 RCU/WCU minimum which would be wasteful for this workload
-- C) Lock operations require the higher consistency model only `PAY_PER_REQUEST` provides
-- D) `PROVISIONED` doesn't support the `LockID` partition key Terraform requires
+**Q5.** SandCastle uses S3 native state locking (`use_lockfile = true`) instead of the older DynamoDB lock table pattern. Mid-apply, your laptop dies. You restart it and run `terraform apply` again, but it fails with "Error acquiring the state lock." What's the *correct first* recovery action?
+- A) Manually delete the `.tflock` object from the S3 bucket using `aws s3 rm`
+- B) Run `terraform force-unlock <LOCK_ID>` using the lock ID printed in the error message
+- C) Delete the entire S3 bucket and re-run the bootstrap script
+- D) Roll back the state file using S3 versioning to the version from before the failed apply
 
 <details>
 <summary>Answers</summary>
 
-1. **C** — The chicken-and-egg framing. Note A (rate limiting), B (DynamoDB-can't-be-Terraformed), and D (no S3 support) are all plausible-sounding wrong answers — Terraform can absolutely create both S3 buckets and DynamoDB tables, the issue is purely about ordering.
+1. **C** — The chicken-and-egg framing. Note A (rate limiting), B (one resource type but not the other), and D (no S3 support) are all plausible-sounding wrong answers — Terraform can absolutely create both S3 buckets and DynamoDB tables; the issue is purely about ordering. Note also: SandCastle skips DynamoDB entirely and uses S3 native locking, but the chicken-and-egg problem still applies to the S3 bucket itself.
 
-2. **A** — State corruption is the real risk. Note B is wrong but tempting: Terraform doesn't queue applies, that's what the DynamoDB lock is supposed to do (and is absent in this scenario). C confuses object versioning with concurrency control.
+2. **A** — State corruption is the real risk. Note B is wrong but tempting: Terraform doesn't queue applies — that's what state locking (DynamoDB table *or* S3 `use_lockfile`) is for, and is absent in this scenario. C confuses object versioning with concurrency control.
 
 3. **D** — S3 versioning is exactly why we enabled it on Day 1. Note A (`terraform refresh`) sounds plausible but refresh updates state from reality — it can't undo a corruption that already wrote bad state. B works but is hours of work; D is seconds.
 
 4. **B** — `BlockPublicPolicy` specifically prevents new public bucket policies from being attached. `BlockPublicAcls` (A) deals with ACLs, not policies. `IgnorePublicAcls` (C) ignores existing public ACLs. `RestrictPublicBuckets` (D) prevents public access at the request level. All four together form defense-in-depth — the question asks which one targets the specific scenario.
 
-5. **A** — Cost behavior. Note B is wrong on the specifics (provisioned has no 25 RCU minimum — you can provision as low as 1). C and D invent technical requirements that don't exist. The real reason is purely economic: sporadic workloads + always-on provisioning = waste.
+5. **B** — `terraform force-unlock <LOCK_ID>` is the canonical recovery path and works the same way across all backends (S3, DynamoDB, Terraform Cloud). A (manually deleting the `.tflock` object) *works* but is the break-glass move for when force-unlock itself fails; reach for it second, not first. C is nuclear and would also delete your actual state file — disaster. D is wrong because state isn't corrupted here — the state file is fine; what's stale is the lock file. Versioning solves a different problem.
 
 </details>
 
@@ -370,7 +349,7 @@ Add to `LEARNINGS.md`:
 These are the kinds of questions a cloud engineer interviewer would ask about today's work. Practice answering them out loud, in 1-2 minutes each.
 
 1. **"Walk me through how you'd set up Terraform state for a new project."**
-   *Hint: Mention the chicken-and-egg problem, S3 + DynamoDB pattern, versioning, encryption, and why a bootstrap script is the standard approach.*
+   *Hint: Mention the chicken-and-egg problem, the S3 bucket setup (versioning, encryption, block public access), and the locking decision. Be ready to compare the two patterns: traditional S3 + DynamoDB table vs. S3 with native `use_lockfile` (Terraform 1.10+). SandCastle uses the native pattern; CloudHunt uses the DynamoDB pattern. Knowing both — and *why* you'd choose one over the other — is the senior-engineer answer.*
 
 2. **"Why use S3 for Terraform state instead of just keeping it local?"**
    *Hint: Collaboration, durability, accessibility from any machine, encryption at rest, versioning.*
@@ -445,15 +424,19 @@ Create `terraform/backend.tf` using the output from yesterday's bootstrap script
 
 ```hcl
 terraform {
+  required_version = ">= 1.10"
+
   backend "s3" {
-    bucket         = "sandcastle-terraform-state-989126024881"
-    key            = "phase-1/terraform.tfstate"
-    region         = "us-east-1"
-    dynamodb_table = "sandcastle-terraform-lock"
-    encrypt        = true
+    bucket       = "sandcastle-terraform-state-989126024881"
+    key          = "phase-1/terraform.tfstate"
+    region       = "us-east-1"
+    encrypt      = true
+    use_lockfile = true
   }
 }
 ```
+
+**Why `use_lockfile = true` and no `dynamodb_table`?** SandCastle uses Terraform 1.10+'s native S3 locking. Whenever a state-mutating command runs, Terraform creates a `<state-key>.tflock` object in the same bucket using S3's conditional-write support, then deletes it on completion. This replaces the older DynamoDB-table pattern with one fewer resource to manage. **Note**: the `required_version = ">= 1.10"` line is load-bearing — older Terraform versions don't understand `use_lockfile` and will error out.
 
 ## Step 3: Define variables and outputs (10 min)
 
@@ -1884,7 +1867,7 @@ EOF
 
 Track this as tech debt in CloudHunt's `LEARNINGS.md`.
 
-**Note**: Right now your IAM role only has SSM + CloudWatch + AssumeRole permissions. For CloudHunt's Terraform to actually plan/apply, you'd either need to (a) broaden the keep's role temporarily, or (b) create a `cloudhunt-dev` role and add its ARN to `project_role_arns` in the IAM module. For today's exercise, just confirm that `terraform init` works (it only needs S3 + DynamoDB access for state). Full project apply is a future task.
+**Note**: Right now your IAM role only has SSM + CloudWatch + AssumeRole permissions. For CloudHunt's Terraform to actually plan/apply, you'd either need to (a) broaden the keep's role temporarily, or (b) create a `cloudhunt-dev` role and add its ARN to `project_role_arns` in the IAM module. For today's exercise, just confirm that `terraform init` works (it only needs S3 access for state — and *DynamoDB* access for CloudHunt's lock table, since CloudHunt uses the traditional DynamoDB locking pattern, unlike SandCastle which uses S3 native locking). Full project apply is a future task.
 
 ## Step 4: Initialize CloudHunt from the keep (10 min)
 
@@ -2014,7 +1997,7 @@ CloudHunt running from inside SandCastle. Git, SSH keys, VS Code Remote-Tunnels 
    *Hint: Per-project IAM roles, instance profile permits only `AssumeRole` for those roles, profile-based AWS CLI config with `credential_source = Ec2InstanceMetadata`.*
 
 4. **"What's the failure mode if `terraform init` can't connect to its remote state backend?"**
-   *Hint: Init fails. Without state, Terraform can't plan or apply. Network connectivity, IAM permissions on the state bucket, and DynamoDB lock table availability all matter.*
+   *Hint: Init fails. Without state, Terraform can't plan or apply. Network connectivity, IAM permissions on the state bucket, and lock-mechanism availability all matter. For SandCastle (S3 native locking) the only backend dependency is the S3 bucket; for CloudHunt (DynamoDB locking) you'd also need the lock table reachable.*
 
 5. **"Walk me through your IAM model for a multi-project personal AWS environment."**
    *Hint: Instance profile → role with minimal direct perms → AssumeRole on per-project roles → each project role has scoped permissions. CloudTrail logs every assume.*
@@ -2114,7 +2097,7 @@ You already have a solid README from the documentation phase. Today's edits are 
 ## YYYY-MM-DD — Phase 1 Complete
 
 **What I built across 7 days**:
-- Terraform state backend (S3 + DynamoDB)
+- Terraform state backend (S3 with native locking via `use_lockfile`)
 - VPC with public subnet, IGW, no-ingress security group
 - IAM role + instance profile with SSM, CloudWatch, AssumeRole
 - t3.medium EC2 instance with gp3 encrypted storage, IMDSv2 required

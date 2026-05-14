@@ -138,7 +138,7 @@ sandcastle/
 │   └── images/
 │       └── architecture.png     ← rendered diagram
 ├── bootstrap/
-│   └── bootstrap-state-backend.sh   ← one-time setup of S3 + DynamoDB for tfstate
+│   └── bootstrap-state-backend.sh   ← one-time setup of S3 (with native locking) for tfstate
 ├── terraform/
 │   ├── backend.tf
 │   ├── providers.tf
@@ -170,7 +170,7 @@ sandcastle/
 
 - AWS account (this project uses account `989126024881`)
 - AWS CLI v2 configured with admin credentials for initial bootstrap
-- Terraform >= 1.6
+- Terraform >= 1.10 (required for S3 native state locking via `use_lockfile`)
 - An IAM user or role with permissions to create VPC, EC2, IAM, Lambda, EventBridge, and CloudWatch resources
 
 ### Deployment
